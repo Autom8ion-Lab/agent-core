@@ -34,6 +34,53 @@ export interface InteragentResponse {
 
 const HEADER = "x-interagent-secret";
 
+/**
+ * Marker header that an app's perimeter host-gate middleware sets AFTER it has cryptographically
+ * verified a Cloudflare Access assertion (signature + `aud` + `iss` against the team JWKS). It is
+ * the ONLY trustworthy signal that a request was Access-authenticated at the edge.
+ *
+ * SECURITY CONTRACT — the middleware that sets this MUST, on EVERY request:
+ *   1. delete/strip any client-supplied copy of this header, and
+ *   2. set it (to "1") ONLY after the Cf-Access-Jwt-Assertion JWT verifies.
+ *
+ * This module deliberately does NOT read the raw `Cf-Access-Jwt-Assertion` header: its mere
+ * presence is forgeable by any caller, which was exactly the pre-2026-09 bypass. Trust flows only
+ * through this middleware-controlled marker. (JWKS verification lives at the perimeter, not here,
+ * so this shared check stays synchronous — no `await` in the ~20 route handlers that call it.)
+ */
+export const ACCESS_VERIFIED_HEADER = "x-agent-access-verified";
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/** Strips the port and any IPv6 brackets, then tests against the loopback set. */
+function isLoopbackHost(raw: string | null): boolean {
+  if (!raw) return false;
+  const host = raw.trim().toLowerCase();
+  const hostname = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0];
+  return LOOPBACK_HOSTS.has(hostname);
+}
+
+/**
+ * True when a request already proved its identity through a boundary STRONGER than the shared
+ * secret, so an owner/human request should not additionally need a static string meant for
+ * sibling agents:
+ *
+ *   - It never left the machine: Host (and X-Forwarded-Host, if present) are both loopback. All
+ *     three agents bind 127.0.0.1, so a request with Host=127.0.0.1 cannot have arrived from
+ *     outside. Requiring BOTH headers loopback-or-absent is the fail-closed direction (a proxy may
+ *     preserve Host while signalling the real origin via X-Forwarded-Host).
+ *   - Cloudflare Access authenticated a real human at the edge AND the app's perimeter middleware
+ *     cryptographically verified that assertion and stamped `ACCESS_VERIFIED_HEADER` (see its
+ *     contract above). We trust that middleware-set marker — never the raw, forgeable
+ *     `Cf-Access-Jwt-Assertion` header.
+ */
+function isAlreadyTrusted(req: Request): boolean {
+  const host = req.headers.get("host");
+  const forwarded = req.headers.get("x-forwarded-host");
+  if (isLoopbackHost(host) && (forwarded === null || isLoopbackHost(forwarded))) return true;
+  return req.headers.get(ACCESS_VERIFIED_HEADER) === "1";
+}
+
 /** Header to attach on an outbound inter-agent call. Omits the header (rather than sending an
  *  empty one) when no shared secret is configured, so local dev without INTERAGENT_SHARED_SECRET
  *  set still works — the receiver's own check treats a missing configured secret as "auth off". */
@@ -43,15 +90,28 @@ export function interagentAuthHeaders(): Record<string, string> {
 }
 
 /**
- * Verify an inbound inter-agent call. Returns true when either (a) no INTERAGENT_SHARED_SECRET is
- * configured on this receiver (auth intentionally off — e.g. local dev), or (b) the request's
- * header matches it. Does NOT verify against a specific `from` claim — the header alone identifies
- * "this came from one of my sibling agents on the same machine," which is the actual trust
- * boundary here (all three bind to 127.0.0.1); the `from` field in the body is caller-attribution
- * for logging, not an identity check.
+ * Verify an inbound inter-agent call. Returns true when any of:
+ *   (a) no INTERAGENT_SHARED_SECRET is configured on this receiver (auth intentionally off — e.g.
+ *       local dev),
+ *   (b) the request's `x-interagent-secret` header matches the configured secret, or
+ *   (c) the request already cleared a stronger boundary — loopback, or Access-verified at the
+ *       perimeter (see `isAlreadyTrusted`).
+ *
+ * (c) exists because of a real incident: on 2026-08-04, FRIDAY's own web chat 401'd on every
+ * message once INTERAGENT_SHARED_SECRET was set, because a browser's own fetch never attaches this
+ * header. A caller that already proved it is the owner (loopback, or Access) should not
+ * additionally need a static string meant for OTHER AGENTS. Crucially, the Access half of (c) now
+ * trusts only the middleware-verified `ACCESS_VERIFIED_HEADER` marker — not the raw, forgeable
+ * `Cf-Access-Jwt-Assertion` header, which previously let any caller bearing that header name bypass
+ * this check.
+ *
+ * Does NOT verify against a specific `from` claim — the header/marker identifies the trust
+ * boundary, not a per-agent identity; the `from` field in the body is caller-attribution for
+ * logging, not an identity check.
  */
 export function verifyInteragentSecret(req: Request): boolean {
   const secret = process.env.INTERAGENT_SHARED_SECRET?.trim();
   if (!secret) return true;
-  return req.headers.get(HEADER) === secret;
+  if (req.headers.get(HEADER) === secret) return true;
+  return isAlreadyTrusted(req);
 }
